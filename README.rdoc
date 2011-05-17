@@ -6,7 +6,7 @@ Mogwee Push is a simple library for communicating with Apple's Push Notification
 
 Please note: the code contains very few Javadocs or really documentation of any sort.  It's devoid of unit tests.  The main reasons to use it other than something like, say, javapns[http://code.google.com/p/javapns/] are:
 1. It's extremely simple (fewer than 1,000 lines, with the real "meat" at around 100 lines).
-2. It allows re-use of the same connection for more than one message (unlike javapns, which opens a new connection for every message).
+2. It allows a single server to efficiently send both development and production notifications (unlike javapns, whose singleton design requires re-opening the connection to switch between development and production).
 
 
 == Apple Push Notification Service Documentation
