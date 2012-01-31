@@ -16,25 +16,67 @@
 
 package com.mogwee.push;
 
+import com.mogwee.executors.Executors;
 import com.mogwee.logging.Logger;
+import org.joda.time.DateTime;
+import org.joda.time.DateTimeUtils;
+import org.joda.time.DateTimeZone;
 
+import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
-public class ApnsSocket
+public class ApnsSocket implements Closeable
 {
     private static final Logger LOG = Logger.getLogger();
 
     private final ApnsSocketFactory factory;
+    private final FeedbackService.FailedTokenProcessor failedTokenProcessor;
+    private final ExecutorService reader = Executors.newSingleThreadExecutor("ApnsSocket Reader");
+    private final String[] recentTokens = new String[100];
+    private final AtomicInteger errorCount = new AtomicInteger(0);
 
     private Socket socket = null;
     private OutputStream out = null;
+    private InputStream in = null;
+    private int nextMessageId = 123; // start at something other than 0 out of paranoia...
 
+    /**
+     * Creates an ApnsSocket that logs but otherwise ignores error responses.
+     * @param factory the parent socket factory
+     */
     public ApnsSocket(ApnsSocketFactory factory)
     {
+        this(factory, null);
+    }
+
+    /**
+     * Creates an ApnsSocket that logs and reports error responses.
+     * @param factory the parent socket factory
+     * @param failedTokenProcessor callback handler for error responses
+     */
+    public ApnsSocket(ApnsSocketFactory factory, FeedbackService.FailedTokenProcessor failedTokenProcessor)
+    {
         this.factory = factory;
+        this.failedTokenProcessor = failedTokenProcessor;
+    }
+
+    /**
+     * Identical to calling {@link #send(String, byte[], long, java.util.concurrent.TimeUnit)} with an expiration of 8 hours.
+     * @param deviceToken the 64-hex-digit APNS token
+     * @param payloadBytes the JSON object to send
+     * @throws java.io.IOException if an error occurs talking to Apple
+     */
+    public synchronized void send(String deviceToken, byte[] payloadBytes) throws IOException
+    {
+        send(deviceToken, payloadBytes, 8, TimeUnit.HOURS);
     }
 
     /**
@@ -55,7 +97,7 @@ public class ApnsSocket
      * aps.put("alert", "This is a push notification!");
      * aps.put("badge", 15);
      * aps.put("sound", "default");
-     * 
+     *
      * Map<String, Object> payload = new LinkedHashMap<String, Object>();
      *
      * payload.put("aps", aps);
@@ -68,19 +110,26 @@ public class ApnsSocket
      * }</pre>
      * @param deviceToken the 64-hex-digit APNS token
      * @param payloadBytes the JSON object to send
+     * @param expiration how long to retry delivering to an unreachable device
+     * @param expirationUnit the time unit of the expiration parameter
      * @throws IOException if an error occurs talking to Apple
      */
-    public synchronized void send(String deviceToken, byte[] payloadBytes) throws IOException
+    public synchronized void send(String deviceToken, byte[] payloadBytes, long expiration, TimeUnit expirationUnit) throws IOException
     {
-        byte[] tokenBytes = getTokenBytes(deviceToken);
+        byte[] tokenBytes = Hex.hexToBytes(deviceToken);
 
         try {
-            //       | 0 | token length | device token | payload length |     payload    |
-            // bytes   1        2         token length         2          payload length
-            int bufferSize = 1 + 2 + tokenBytes.length + 2 + payloadBytes.length;
+            //       | 0 | id | expiry | token length | device token | payload length |     payload    |
+            // bytes   1    4     4           2         token length         2          payload length
+            int bufferSize = 1 + 4 + 4 + 2 + tokenBytes.length + 2 + payloadBytes.length;
             ByteBuffer buffer = ByteBuffer.allocate(bufferSize);
+            int messageId = nextMessageId;
+            int expirationEpoch = (int) (TimeUnit.SECONDS.convert(DateTimeUtils.currentTimeMillis(), TimeUnit.MILLISECONDS) + TimeUnit.SECONDS.convert(expiration, expirationUnit));
 
-            buffer.put((byte) 0);
+            ++nextMessageId;
+            buffer.put((byte) 1);
+            buffer.putInt(messageId);
+            buffer.putInt(expirationEpoch);
             buffer.putShort((short) tokenBytes.length);
             buffer.put(tokenBytes);
             buffer.putShort((short) payloadBytes.length);
@@ -89,56 +138,113 @@ public class ApnsSocket
             if (socket == null) {
                 socket = factory.createSocket();
                 out = socket.getOutputStream();
+                in = socket.getInputStream();
+                reader.submit(new ErrorChecker());
             }
 
-            out.write(buffer.array());
+            byte[] array = buffer.array();
+
+            recentTokens[messageId % recentTokens.length] = deviceToken;
+            out.write(array);
             out.flush();
         }
         catch (IOException e) {
             LOG.infoDebugf(e, "Closing socket for %s: %s %s", factory, deviceToken, new String(payloadBytes, "UTF-8"));
-            CloseableUtil.closeQuietly(socket);
-            CloseableUtil.closeQuietly(out);
-            socket = null;
-            out = null;
+            close();
 
             throw e;
         }
     }
 
-    private byte[] getTokenBytes(String deviceToken)
+    @Override
+    public synchronized void close()
     {
-        byte[] tokenBytes = new byte[deviceToken.length() / 2];
+        CloseableUtil.closeQuietly(socket);
+        CloseableUtil.closeQuietly(out);
+        CloseableUtil.closeQuietly(in);
+        socket = null;
+        out = null;
+        in = null;
 
-        for (int i = 0; i < deviceToken.length(); i += 2) {
-            char c1 = deviceToken.charAt(i);
-            char c2 = deviceToken.charAt(i + 1);
-            int value = 0;
-
-            if ('0' <= c1 && c1 <= '9') {
-                value = c1 - '0';
-            }
-            else if ('a' <= c1 && c1 <= 'f') {
-                value = c1 - ('a' - 10);
-            }
-            else if ('A' <= c1 && c1 <= 'f') {
-                value = c1 - ('A' - 10);
-            }
-
-            value <<= 4;
-
-            if ('0' <= c2 && c2 <= '9') {
-                value |= c2 - '0';
-            }
-            else if ('a' <= c2 && c2 <= 'f') {
-                value |= c2 - ('a' - 10);
-            }
-            else if ('A' <= c2 && c2 <= 'f') {
-                value |= c2 - ('A' - 10);
-            }
-
-            tokenBytes[i / 2] = (byte) value;
+        for (int i = 0; i < recentTokens.length; i++) {
+            recentTokens[i] = null;
         }
+    }
 
-        return tokenBytes;
+    public int getErrorCount()
+    {
+        return errorCount.get();
+    }
+
+    private class ErrorChecker implements Runnable
+    {
+        @Override
+        public void run()
+        {
+            try {
+                //       | 8 | status | id |
+                // bytes   1      1      4
+                byte[] error = new byte[1 + 1 + 4];
+                int offset = 0;
+                int left = error.length;
+
+                while (left > 0) {
+                    int read = in.read(error, offset, left);
+
+                    if (read < 0) {
+                        if (left != error.length) {
+                            LOG.warnf("Socket closed partway through error response: %s", Arrays.toString(error));
+                        }
+
+                        return;
+                    }
+
+                    left -= read;
+                }
+
+                ByteBuffer buffer = ByteBuffer.wrap(error);
+                byte command = buffer.get();
+                byte status = buffer.get();
+                int problemMessageId = buffer.getInt();
+
+                if (command != 8) {
+                    LOG.warnf("Funny response from Apple: %s", Arrays.toString(error));
+                }
+
+                errorCount.incrementAndGet();
+
+                synchronized (ApnsSocket.this) {
+                    int messagesSentSinceProblem = nextMessageId - problemMessageId;
+
+                    if (problemMessageId < 0 || messagesSentSinceProblem < 0) {
+                        LOG.warnf("Server reported error %s for message in the future?! (%s > %s)", status, problemMessageId, nextMessageId);
+                    }
+                    else {
+                        if (messagesSentSinceProblem >= recentTokens.length) {
+                            LOG.warnf("Too many messages sent since error %s; some messages have been lost (%s - %s > %s)", status, nextMessageId, problemMessageId, recentTokens.length);
+                        }
+                        else {
+                            String failedToken = recentTokens[problemMessageId % recentTokens.length];
+
+                            LOG.infof("Server reported error %s for message %s sent to %s", status, problemMessageId, failedToken);
+
+                            if (status == 8 && failedToken != null && failedTokenProcessor != null) {
+                                // invalid token
+                                failedTokenProcessor.tokenWithFailure(failedToken, new DateTime(DateTimeZone.UTC));
+                            }
+                        }
+                    }
+                }
+            }
+            catch (IOException e) {
+                LOG.infoDebugf(e, "Stopping error reader for %s", factory);
+            }
+            catch (RuntimeException e) {
+                LOG.warnf(e, "Stopping error reader for %s", factory);
+            }
+            finally {
+                close();
+            }
+        }
     }
 }

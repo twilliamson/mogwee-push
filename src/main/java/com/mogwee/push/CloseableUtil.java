@@ -22,7 +22,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.net.Socket;
 
-public class CloseableUtil
+class CloseableUtil
 {
     private static final Logger LOG = Logger.getLogger();
 
