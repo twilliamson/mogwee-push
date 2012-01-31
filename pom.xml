@@ -144,6 +144,7 @@
                                 <exclude>run-local.sh</exclude>
                                 <exclude>src/site/**</exclude>
                                 <exclude>*.log</exclude>
+                                <exclude>src/test/java/com/mogwee/push/CreateAppleCertificateKeystore.java</exclude>
                             </excludes>
                         </configuration>
                     </execution>
